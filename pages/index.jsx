@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { CANVAS, DEFAULT_CATCH_SIZE, renderSlide, renderToCanvas, ensureFonts, drawCover } from '../lib/render';
+import { CANVAS, DEFAULT_CATCH_SIZE, renderSlide, renderToCanvas, ensureFonts, drawCover, autoDimFor } from '../lib/render';
+import { PROMPT_FIELDS } from '../lib/promptOptions';
 import { generateBackground, BACKGROUND_TYPES } from '../lib/backgrounds';
 import { DEFAULT_DOCS } from '../lib/defaultDocs';
 
@@ -35,6 +36,8 @@ function makeSlide(source, extra = {}) {
     auto: false,
     bgType: null,
     prompt: '',
+    dim: 0,
+    dimMode: 'center',
     ...extra,
   };
 }
@@ -167,7 +170,8 @@ export default function Home() {
   slidesRef.current = slides;
 
   const [aiOpen, setAiOpen] = useState(false);
-  const [aiPrompt, setAiPrompt] = useState('');
+  const [aiChoices, setAiChoices] = useState({});
+  const [aiExtra, setAiExtra] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState('');
 
@@ -301,7 +305,7 @@ export default function Home() {
     if (!files.length) return;
     const results = await Promise.all(files.map((f) => fileToSource(f).catch(() => null)));
     const ok = results.filter(Boolean);
-    addSlides(ok.map((src) => makeSlide(src)));
+    addSlides(ok.map((src) => makeSlide(src, { dim: autoDimFor(src) })));
     if (ok.length < files.length) showToast(`${files.length - ok.length}枚の画像を読み込めませんでした`);
     else showToast(`${ok.length}枚の画像を追加しました`);
   };
@@ -317,14 +321,16 @@ export default function Home() {
     updateActive({ source: src, thumb: makeThumb(src) });
   };
 
+  const aiReady = aiExtra.trim() || Object.values(aiChoices).some(Boolean);
+
   const generateAi = async () => {
-    if (!aiPrompt.trim()) return;
+    if (!aiReady) return;
     setAiBusy(true);
     setAiError('');
     try {
-      const data = await postJSON('/api/image', { password: pwRef.current, prompt: aiPrompt.trim() });
+      const data = await postJSON('/api/image', { password: pwRef.current, choices: aiChoices, extra: aiExtra.trim() });
       const src = await imageToSource(data.image);
-      addSlides([makeSlide(src, { prompt: data.prompt })]);
+      addSlides([makeSlide(src, { prompt: data.summary, dim: autoDimFor(src) })]);
       showToast('AI画像を追加しました');
     } catch (e) {
       setAiError(e.message);
@@ -503,18 +509,51 @@ export default function Home() {
 
             {aiOpen && (
               <div className="ai-box">
-                <textarea
-                  className="input"
-                  rows={3}
-                  value={aiPrompt}
-                  onChange={(e) => setAiPrompt(e.target.value)}
-                  placeholder="例：夜のスタジオでマイクに向かって歌う30代の女性"
-                />
-                <p className="hint">日本語でOK。K&apos;s VOXらしい雰囲気（シネマティック・暖色系・文字なし）の指定は自動で追加されます。</p>
+                <div className="ai-grid">
+                  {PROMPT_FIELDS.map((f) => (
+                    <label key={f.key} className="ai-field">
+                      <span className="sub-label">{f.label}</span>
+                      <select
+                        className="select select-full"
+                        value={aiChoices[f.key] || ''}
+                        onChange={(e) => setAiChoices((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                      >
+                        <option value="">おまかせ</option>
+                        {f.options.map((o) => (
+                          <option key={o.id} value={o.id}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ))}
+                </div>
+                <label className="ai-field">
+                  <span className="sub-label">追加の指示（日本語で自由に）</span>
+                  <textarea
+                    className="input"
+                    rows={2}
+                    value={aiExtra}
+                    onChange={(e) => setAiExtra(e.target.value)}
+                    placeholder="例：場所は誰もいない静かな海辺"
+                  />
+                </label>
+                <p className="hint">選ばなかった項目はおまかせです。項目と追加の指示が食い違うときは、追加の指示が優先されます。K&apos;s VOXらしい質感（シネマティック・暖色系・文字なし）は自動で加わります。</p>
                 {aiError && <p className="error">{aiError}</p>}
-                <button className="btn btn-primary btn-block" onClick={generateAi} disabled={aiBusy || !aiPrompt.trim()}>
-                  {aiBusy ? '生成しています…（10〜30秒）' : '画像を生成する'}
-                </button>
+                <div className="ai-actions">
+                  <button
+                    className="link"
+                    onClick={() => {
+                      setAiChoices({});
+                      setAiExtra('');
+                    }}
+                  >
+                    選択をリセット
+                  </button>
+                  <button className="btn btn-primary" onClick={generateAi} disabled={aiBusy || !aiReady}>
+                    {aiBusy ? '生成しています…（10〜30秒）' : '画像を生成する'}
+                  </button>
+                </div>
               </div>
             )}
 
@@ -547,7 +586,7 @@ export default function Home() {
           {current && (
             <section className="block">
               <div className="block-head">
-                <h2 className="block-title">キャッチ（{active + 1}枚目）</h2>
+                <h2 className="block-title">キャッチと写真（{active + 1}枚目）</h2>
                 {current.bgType && (
                   <button className="link" onClick={redrawBackground}>
                     背景を描き直す
@@ -596,6 +635,37 @@ export default function Home() {
                 <button className="link" onClick={() => updateActive({ size: DEFAULT_CATCH_SIZE })}>
                   標準に戻す
                 </button>
+              </div>
+
+              <div className="sub-label">
+                写真の暗さ <span className="value">{current.dim}%</span>
+              </div>
+              <div className="range-row">
+                <input
+                  type="range"
+                  min={0}
+                  max={70}
+                  value={current.dim}
+                  onChange={(e) => updateActive({ dim: Number(e.target.value) })}
+                />
+                <button className="link" onClick={() => updateActive({ dim: autoDimFor(current.source) })}>
+                  おまかせ
+                </button>
+              </div>
+              <div className="seg seg-small">
+                {[
+                  ['center', '文字の周りだけ'],
+                  ['all', '写真全体'],
+                ].map(([v, name]) => (
+                  <button
+                    key={v}
+                    className={`seg-item ${current.dimMode === v ? 'is-on' : ''}`}
+                    onClick={() => updateActive({ dimMode: v })}
+                    aria-pressed={current.dimMode === v}
+                  >
+                    <span className="seg-name">{name}</span>
+                  </button>
+                ))}
               </div>
             </section>
           )}

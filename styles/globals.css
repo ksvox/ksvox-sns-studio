@@ -623,3 +623,39 @@ select {
     transition: none !important;
   }
 }
+
+/* ── AI生成の項目 ── */
+.ai-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 10px;
+}
+.ai-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.select-full {
+  width: 100%;
+  font-size: 13.5px;
+  padding: 7px 10px;
+}
+.ai-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.seg-small .seg-item {
+  padding: 8px 12px;
+  align-items: center;
+}
+.seg-small .seg-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+@media (max-width: 420px) {
+  .ai-grid {
+    grid-template-columns: 1fr;
+  }
+}

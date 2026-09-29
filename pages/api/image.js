@@ -1,17 +1,19 @@
 import { checkPassword } from '../../lib/auth';
 import { callGemini } from '../../lib/gemini';
+import { buildEnglishFromChoices, summarizeChoicesJa } from '../../lib/promptOptions';
 
-// アプリ側で必ず追加する K's VOX 用の画づくり指定
+// アプリ側で必ず追加する K's VOX 用の「画づくりの質感」（場所や被写体は決めない）
 const KSVOX_STYLE =
-  'cinematic photograph, warm tungsten lighting, amber and deep brown color palette, ' +
-  'soft window light, shallow depth of field, moody and elegant atmosphere, ' +
-  'intimate vocal studio feeling, subtle film grain, highly detailed, realistic. ' +
+  'cinematic photograph, warm color grading with amber tones, shallow depth of field, ' +
+  'elegant and moody atmosphere, subtle film grain, highly detailed, photorealistic. ' +
   'The center of the frame stays calm and uncluttered. ' +
   'No text, no letters, no words, no captions, no signage, no logo, no watermark.';
 
-const TRANSLATE_SYSTEM = `You write prompts for a photorealistic image generator.
-Convert the user's request (Japanese or English) into one concise English prompt of at most 60 words.
-Describe the scene, the people (if any), their action and expression, the setting and the lighting.
+const MERGE_SYSTEM = `You write prompts for a photorealistic image generator.
+You receive (1) a base description in English built from menu choices (may be empty) and (2) extra instructions in Japanese.
+Write one coherent English prompt of at most 80 words.
+The Japanese extra instructions have priority: if they conflict with the base description (for example a different place or person), follow the Japanese instructions and drop the conflicting part.
+Keep every non-conflicting detail from the base description.
 Never ask for text, letters, signs or logos in the image.
 Output only the prompt.`;
 
@@ -27,15 +29,23 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'サーバーにCF_ACCOUNT_ID / CF_API_TOKENが設定されていません。' });
   }
 
-  const userPrompt = String((req.body && req.body.prompt) || '').trim();
-  if (!userPrompt) return res.status(400).json({ error: '画像の説明を入力してください。' });
+  const choices = (req.body && req.body.choices) || {};
+  const extra = String((req.body && req.body.extra) || '').trim();
+  const base = buildEnglishFromChoices(choices);
+  if (!base && !extra) return res.status(400).json({ error: '項目を選ぶか、追加の指示を入力してください。' });
 
-  // 日本語の指示を英語の画像プロンプトに整える（失敗したらそのまま使う）
-  let scene = userPrompt;
-  try {
-    scene = await callGemini({ system: TRANSLATE_SYSTEM, prompt: userPrompt, temperature: 0.6 });
-  } catch (e) {
-    // 翻訳できなくても生成は続行
+  // 自由入力（日本語）がある場合だけ、Geminiで英語に直して項目と統合する
+  let scene = base;
+  if (extra) {
+    try {
+      scene = await callGemini({
+        system: MERGE_SYSTEM,
+        prompt: `Base description: ${base || '(none)'}\nExtra instructions (Japanese): ${extra}`,
+        temperature: 0.5,
+      });
+    } catch (e) {
+      scene = [extra, base].filter(Boolean).join(', ');
+    }
   }
   const finalPrompt = `${scene.replace(/\s+/g, ' ').slice(0, 1200)}. ${KSVOX_STYLE}`;
 
@@ -56,7 +66,7 @@ export default async function handler(req, res) {
         error: `画像を生成できませんでした。今日の無料枠を使い切ったか、一時的な不具合の可能性があります。（${msg}）`,
       });
     }
-    res.status(200).json({ image: `data:image/jpeg;base64,${image}`, prompt: userPrompt });
+    res.status(200).json({ image: `data:image/jpeg;base64,${image}`, summary: summarizeChoicesJa(choices, extra) });
   } catch (e) {
     res.status(500).json({ error: `画像生成サービスに接続できませんでした。（${e.message}）` });
   }
