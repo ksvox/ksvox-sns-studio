@@ -9,11 +9,16 @@ const KSVOX_STYLE =
   'The center of the frame stays calm and uncluttered. ' +
   'No text, no letters, no words, no captions, no signage, no logo, no watermark.';
 
-const MERGE_SYSTEM = `You write prompts for a photorealistic image generator.
-You receive (1) a base description in English built from menu choices (may be empty) and (2) extra instructions in Japanese.
-Write one coherent English prompt of at most 80 words.
-The Japanese extra instructions have priority: if they conflict with the base description (for example a different place or person), follow the Japanese instructions and drop the conflicting part.
-Keep every non-conflicting detail from the base description.
+const COMPOSE_SYSTEM = `You write prompts for a photorealistic image generator.
+You may receive:
+(A) extra instructions in Japanese — highest priority
+(B) a base description in English built from menu choices
+(C) a Japanese social media post that this image will accompany
+(D) background notes about a vocal school — context only
+Write one coherent English prompt (at most 80 words) describing a single photograph.
+Priority is A > B > C > D. When they conflict, follow the higher priority and drop the conflicting part. Keep every non-conflicting detail of A and B.
+Use C to choose a scene, situation, emotion and mood that visually expresses the message of the post. Express it through the picture, never through written words.
+Use D only to keep the scene appropriate to the school's atmosphere. Never include the school name, logos or any text.
 Never ask for text, letters, signs or logos in the image.
 Output only the prompt.`;
 
@@ -29,25 +34,34 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'サーバーにCF_ACCOUNT_ID / CF_API_TOKENが設定されていません。' });
   }
 
-  const choices = (req.body && req.body.choices) || {};
-  const extra = String((req.body && req.body.extra) || '').trim();
+  const body = req.body || {};
+  const choices = body.choices || {};
+  const extra = String(body.extra || '').trim();
+  const postText = String(body.postText || '').trim().slice(0, 3000);
+  const docs = String(body.docs || '').trim().slice(0, 4000);
   const base = buildEnglishFromChoices(choices);
-  if (!base && !extra) return res.status(400).json({ error: '項目を選ぶか、追加の指示を入力してください。' });
+  if (!base && !extra && !postText) {
+    return res.status(400).json({ error: '項目を選ぶか、追加の指示かSNS投稿文を入力してください。' });
+  }
 
-  // 自由入力（日本語）がある場合だけ、Geminiで英語に直して項目と統合する
+  // 日本語(追加の指示・投稿文)がある時だけGeminiで英語の指示に組み立てる
   let scene = base;
-  if (extra) {
+  if (extra || postText) {
+    const parts = [];
+    if (extra) parts.push(`(A) Extra instructions (Japanese): ${extra}`);
+    if (base) parts.push(`(B) Base description: ${base}`);
+    if (postText) parts.push(`(C) Social media post (Japanese): ${postText}`);
+    if (docs) parts.push(`(D) Background notes (Japanese): ${docs}`);
     try {
-      scene = await callGemini({
-        system: MERGE_SYSTEM,
-        prompt: `Base description: ${base || '(none)'}\nExtra instructions (Japanese): ${extra}`,
-        temperature: 0.5,
-      });
+      scene = await callGemini({ system: COMPOSE_SYSTEM, prompt: parts.join('\n\n'), temperature: 0.7 });
     } catch (e) {
       scene = [extra, base].filter(Boolean).join(', ');
+      if (!scene) {
+        return res.status(502).json({ error: `投稿文を読み取れませんでした。項目を選ぶか、時間をおいて再度お試しください。（${e.message}）` });
+      }
     }
   }
-  const finalPrompt = `${scene.replace(/\s+/g, ' ').slice(0, 1200)}. ${KSVOX_STYLE}`;
+  const finalPrompt = `${scene.replace(/\s+/g, ' ').slice(0, 1400)}. ${KSVOX_STYLE}`;
 
   try {
     const cf = await fetch(
@@ -55,7 +69,8 @@ export default async function handler(req, res) {
       {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: finalPrompt, steps: 8 }),
+        // seedを毎回変えるので、同じ内容でも別の画像になる
+        body: JSON.stringify({ prompt: finalPrompt, steps: 8, seed: Math.floor(Math.random() * 2147483646) + 1 }),
       }
     );
     const data = await cf.json().catch(() => ({}));
@@ -66,7 +81,8 @@ export default async function handler(req, res) {
         error: `画像を生成できませんでした。今日の無料枠を使い切ったか、一時的な不具合の可能性があります。（${msg}）`,
       });
     }
-    res.status(200).json({ image: `data:image/jpeg;base64,${image}`, summary: summarizeChoicesJa(choices, extra) });
+    const summary = [summarizeChoicesJa(choices, extra), postText ? '投稿文を反映' : ''].filter(Boolean).join(' / ');
+    res.status(200).json({ image: `data:image/jpeg;base64,${image}`, summary });
   } catch (e) {
     res.status(500).json({ error: `画像生成サービスに接続できませんでした。（${e.message}）` });
   }

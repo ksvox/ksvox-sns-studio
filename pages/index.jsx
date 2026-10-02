@@ -1,8 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
-import { CANVAS, DEFAULT_CATCH_SIZE, renderSlide, renderToCanvas, ensureFonts, drawCover, autoDimFor } from '../lib/render';
+import {
+  CANVAS,
+  DEFAULT_CATCH_SIZE,
+  DEFAULT_SUB_SIZE,
+  renderSlide,
+  renderToCanvas,
+  ensureFonts,
+  drawCover,
+  autoDimFor,
+} from '../lib/render';
 import { PROMPT_FIELDS } from '../lib/promptOptions';
 import { generateBackground, BACKGROUND_TYPES } from '../lib/backgrounds';
 import { DEFAULT_DOCS } from '../lib/defaultDocs';
+import { idbGet, idbSet, sourceToBlob, rememberBlob } from '../lib/store';
 
 const COLORS = [
   { v: '#FFFFFF', n: 'ホワイト' },
@@ -11,8 +21,9 @@ const COLORS = [
   { v: '#D4AF37', n: 'ゴールド' },
   { v: '#E9A23B', n: 'アンバー' },
 ];
-const LS = { pw: 'ksvox_pw', docs: 'ksvox_docs', prefs: 'ksvox_prefs' };
+const LS = { pw: 'ksvox_pw', docs: 'ksvox_docs' };
 const DURATIONS = [5, 6, 7, 8, 9, 10];
+const HISTORY_MAX = 10;
 
 let idSeq = 0;
 const newId = () => `s${Date.now()}_${idSeq++}`;
@@ -33,6 +44,9 @@ function makeSlide(source, extra = {}) {
     catch: '',
     color: '#FFFFFF',
     size: DEFAULT_CATCH_SIZE,
+    sub: '',
+    subColor: '#FBF3E4',
+    subSize: DEFAULT_SUB_SIZE,
     auto: false,
     bgType: null,
     prompt: '',
@@ -41,6 +55,8 @@ function makeSlide(source, extra = {}) {
     ...extra,
   };
 }
+
+const autoSlide = () => makeSlide(generateBackground('random'), { auto: true, bgType: 'random' });
 
 async function imageToSource(src) {
   const img = new Image();
@@ -55,10 +71,12 @@ async function imageToSource(src) {
   return c;
 }
 
-async function fileToSource(file) {
-  const url = URL.createObjectURL(file);
+async function blobToSource(blob) {
+  const url = URL.createObjectURL(blob);
   try {
-    return await imageToSource(url);
+    const src = await imageToSource(url);
+    rememberBlob(src, blob);
+    return src;
   } finally {
     URL.revokeObjectURL(url);
   }
@@ -107,6 +125,8 @@ async function postJSON(url, body) {
   return data;
 }
 
+const isTouchDevice = () => typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+
 /* ───────── ログイン画面 ───────── */
 function Login({ onSuccess, initialError }) {
   const [pw, setPw] = useState('');
@@ -134,15 +154,7 @@ function Login({ onSuccess, initialError }) {
         <p className="login-brand">K&apos;s VOX</p>
         <h1 className="login-title">投稿スタジオ</h1>
         <label className="label" htmlFor="pw">パスワード</label>
-        <input
-          id="pw"
-          type="password"
-          className="input"
-          value={pw}
-          onChange={(e) => setPw(e.target.value)}
-          autoComplete="current-password"
-          autoFocus
-        />
+        <input id="pw" type="password" className="input" value={pw} onChange={(e) => setPw(e.target.value)} autoComplete="current-password" autoFocus />
         {error && <p className="error">{error}</p>}
         <button className="btn btn-primary btn-block" disabled={busy || !pw}>
           {busy ? '確認しています…' : '開く'}
@@ -152,17 +164,51 @@ function Login({ onSuccess, initialError }) {
   );
 }
 
+/* 色とサイズの調整（キャッチ・サブテキスト共通） */
+function StyleControls({ color, size, min, max, defaultSize, onColor, onSize }) {
+  return (
+    <>
+      <div className="swatches">
+        {COLORS.map((c) => (
+          <button
+            key={c.v}
+            className={`swatch ${color.toUpperCase() === c.v ? 'is-on' : ''}`}
+            style={{ background: c.v }}
+            onClick={() => onColor(c.v)}
+            aria-label={c.n}
+            title={c.n}
+          />
+        ))}
+        <label className="swatch-free" title="自由に選ぶ">
+          <input type="color" value={color} onChange={(e) => onColor(e.target.value.toUpperCase())} />
+          <span>自由に選ぶ</span>
+        </label>
+      </div>
+      <div className="range-row">
+        <span className="sub-label">
+          サイズ <span className="value">{size}</span>
+        </span>
+        <input type="range" min={min} max={max} value={size} onChange={(e) => onSize(Number(e.target.value))} />
+        <button className="link" onClick={() => onSize(defaultSize)}>
+          標準
+        </button>
+      </div>
+    </>
+  );
+}
+
 /* ───────── メイン ───────── */
 export default function Home() {
   const [auth, setAuth] = useState('checking'); // checking | locked | ok
   const [authError, setAuthError] = useState('');
   const pwRef = useRef('');
 
+  const [ready, setReady] = useState(false); // 保存データの復元が終わったか
   const [format, setFormat] = useState('square');
   const [tag, setTag] = useState('');
   const [showUrl, setShowUrl] = useState(true);
   const [duration, setDuration] = useState(6);
-  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const [postText, setPostText] = useState('');
 
   const [slides, setSlides] = useState([]);
   const [active, setActive] = useState(0);
@@ -174,24 +220,30 @@ export default function Home() {
   const [aiExtra, setAiExtra] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState('');
+  const [aiDone, setAiDone] = useState(false);
+
+  const [history, setHistory] = useState([]); // AI画像の履歴（最新10枚）
+  const historyRef = useRef(history);
+  historyRef.current = history;
+  const [histOpen, setHistOpen] = useState(false);
+  const [histSelecting, setHistSelecting] = useState(false);
+  const [histSelected, setHistSelected] = useState([]);
 
   const [exporting, setExporting] = useState(false);
   const [progress, setProgress] = useState(null);
   const [exportError, setExportError] = useState('');
+  const [result, setResult] = useState(null); // スマホ用の保存パネル
 
   const [docs, setDocs] = useState(DEFAULT_DOCS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [docsDraft, setDocsDraft] = useState('');
 
-  const [caption, setCaption] = useState('');
-  const [hashtags, setHashtags] = useState(['', '', '']);
-  const [capBusy, setCapBusy] = useState(false);
-  const [capError, setCapError] = useState('');
-
   const [shrunk, setShrunk] = useState(false);
   const [toast, setToast] = useState('');
   const canvasRef = useRef(null);
   const fileRef = useRef(null);
+  const saveTimer = useRef(null);
+  const saving = useRef(Promise.resolve());
 
   const showToast = (msg) => {
     setToast(msg);
@@ -218,30 +270,96 @@ export default function Home() {
       });
   }, []);
 
-  /* ログイン後：設定の読み込みと最初の背景 */
+  /* ログイン後：前回の作業とAI画像履歴を復元 */
   useEffect(() => {
-    if (auth !== 'ok') return;
-    try {
-      const p = JSON.parse(localStorage.getItem(LS.prefs) || '{}');
-      if (p.format) setFormat(p.format);
-      if (typeof p.tag === 'string') setTag(p.tag);
-      if (typeof p.showUrl === 'boolean') setShowUrl(p.showUrl);
-      if (p.duration) setDuration(p.duration);
-    } catch (e) {}
-    const d = localStorage.getItem(LS.docs);
-    if (d) setDocs(d);
-    setPrefsLoaded(true);
-    if (slidesRef.current.length === 0) {
-      setSlides([makeSlide(generateBackground('random'), { auto: true, bgType: 'random' })]);
-      setActive(0);
-    }
-  }, [auth]);
+    if (auth !== 'ok' || ready) return;
+    (async () => {
+      const d = localStorage.getItem(LS.docs);
+      if (d) setDocs(d);
+      try {
+        const work = await idbGet('work');
+        if (work) {
+          setFormat(work.format || 'square');
+          setTag(work.tag || '');
+          setShowUrl(work.showUrl !== false);
+          setDuration(work.duration || 6);
+          setPostText(work.postText || '');
+          setAiChoices(work.aiChoices || {});
+          setAiExtra(work.aiExtra || '');
+        }
+        let restored = [];
+        if (work && Array.isArray(work.slides) && work.slides.length) {
+          restored = (
+            await Promise.all(
+              work.slides.map(async ({ blob, ...rest }) => {
+                try {
+                  const src = await blobToSource(blob);
+                  return makeSlide(src, { ...rest, id: newId() });
+                } catch (e) {
+                  return null;
+                }
+              })
+            )
+          ).filter(Boolean);
+        }
+        if (restored.length) {
+          setSlides(restored);
+          setActive(Math.min(work.active || 0, restored.length - 1));
+        } else {
+          setSlides([autoSlide()]);
+          setActive(0);
+        }
+        const hist = (await idbGet('history')) || [];
+        const loaded = (
+          await Promise.all(
+            hist.map(async (h) => {
+              try {
+                const src = await blobToSource(h.blob);
+                return { ...h, source: src, thumb: makeThumb(src) };
+              } catch (e) {
+                return null;
+              }
+            })
+          )
+        ).filter(Boolean);
+        setHistory(loaded);
+      } catch (e) {
+        setSlides([autoSlide()]);
+        setActive(0);
+      }
+      setReady(true);
+    })();
+  }, [auth, ready]);
 
-  /* 設定の自動保存 */
+  /* 作業内容の自動保存（操作が落ち着いてから0.8秒後） */
   useEffect(() => {
-    if (!prefsLoaded) return;
-    localStorage.setItem(LS.prefs, JSON.stringify({ format, tag, showUrl, duration }));
-  }, [format, tag, showUrl, duration, prefsLoaded]);
+    if (!ready) return;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      const snapshot = {
+        list: slidesRef.current,
+        format,
+        tag,
+        showUrl,
+        duration,
+        postText,
+        aiChoices,
+        aiExtra,
+        active,
+      };
+      saving.current = saving.current.then(async () => {
+        try {
+          const slidesData = await Promise.all(
+            snapshot.list.map(async ({ source, thumb, id, ...rest }) => ({ ...rest, blob: await sourceToBlob(source) }))
+          );
+          const { list, ...meta } = snapshot;
+          await idbSet('work', { ...meta, slides: slidesData });
+        } catch (e) {
+          // 保存に失敗しても作業は続けられる
+        }
+      });
+    }, 800);
+  }, [ready, slides, format, tag, showUrl, duration, postText, aiChoices, aiExtra, active]);
 
   /* プレビュー描画 */
   useEffect(() => {
@@ -250,7 +368,7 @@ export default function Home() {
     if (!slide || !c) return;
     let cancelled = false;
     (async () => {
-      await ensureFonts([tag, slide.catch]);
+      await ensureFonts([tag, slide.catch, slide.sub]);
       if (cancelled) return;
       const { w, h } = CANVAS[format];
       if (c.width !== w) c.width = w;
@@ -261,13 +379,13 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [slides, active, format, tag, showUrl, auth]);
+  }, [slides, active, format, tag, showUrl, auth, ready]);
 
   /* ───── 画像の操作 ───── */
   const addSlides = (newOnes) => {
     if (!newOnes.length) return;
     const prev = slidesRef.current;
-    const replacePlaceholder = prev.length === 1 && prev[0].auto && !prev[0].catch.trim();
+    const replacePlaceholder = prev.length === 1 && prev[0].auto && !prev[0].catch.trim() && !prev[0].sub.trim();
     const base = replacePlaceholder ? [] : prev;
     setSlides([...base, ...newOnes]);
     setActive(base.length);
@@ -280,7 +398,7 @@ export default function Home() {
   const removeSlide = (index) => {
     const prev = slidesRef.current;
     if (prev.length === 1) {
-      setSlides([makeSlide(generateBackground('random'), { auto: true, bgType: 'random' })]);
+      setSlides([autoSlide()]);
       setActive(0);
       return;
     }
@@ -303,16 +421,25 @@ export default function Home() {
     const files = Array.from(e.target.files || []).filter((f) => f.type.startsWith('image/'));
     e.target.value = '';
     if (!files.length) return;
-    const results = await Promise.all(files.map((f) => fileToSource(f).catch(() => null)));
+    const results = await Promise.all(
+      files.map(async (f) => {
+        const url = URL.createObjectURL(f);
+        try {
+          return await imageToSource(url);
+        } catch (err) {
+          return null;
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      })
+    );
     const ok = results.filter(Boolean);
     addSlides(ok.map((src) => makeSlide(src, { dim: autoDimFor(src) })));
     if (ok.length < files.length) showToast(`${files.length - ok.length}枚の画像を読み込めませんでした`);
     else showToast(`${ok.length}枚の画像を追加しました`);
   };
 
-  const addBackground = (type) => {
-    addSlides([makeSlide(generateBackground(type), { bgType: type })]);
-  };
+  const addBackground = (type) => addSlides([makeSlide(generateBackground(type), { bgType: type })]);
 
   const redrawBackground = () => {
     const s = slides[active];
@@ -321,16 +448,47 @@ export default function Home() {
     updateActive({ source: src, thumb: makeThumb(src) });
   };
 
-  const aiReady = aiExtra.trim() || Object.values(aiChoices).some(Boolean);
+  const startOver = () => {
+    if (!window.confirm('今の作業を消して、新しく始めますか？\n（AI画像の履歴は残ります）')) return;
+    setSlides([autoSlide()]);
+    setActive(0);
+    setPostText('');
+    setAiExtra('');
+    setAiDone(false);
+    setResult(null);
+    showToast('新しく始めました');
+  };
+
+  /* ───── AI画像 ───── */
+  const aiReady = aiExtra.trim() || postText.trim() || Object.values(aiChoices).some(Boolean);
+
+  const saveHistory = (list) => {
+    idbSet(
+      'history',
+      list.map(({ source, thumb, ...h }) => h)
+    ).catch(() => {});
+  };
 
   const generateAi = async () => {
     if (!aiReady) return;
     setAiBusy(true);
     setAiError('');
     try {
-      const data = await postJSON('/api/image', { password: pwRef.current, choices: aiChoices, extra: aiExtra.trim() });
-      const src = await imageToSource(data.image);
+      const data = await postJSON('/api/image', {
+        password: pwRef.current,
+        choices: aiChoices,
+        extra: aiExtra.trim(),
+        postText: postText.trim(),
+        docs,
+      });
+      const blob = await (await fetch(data.image)).blob();
+      const src = await blobToSource(blob);
       addSlides([makeSlide(src, { prompt: data.summary, dim: autoDimFor(src) })]);
+      const entry = { id: newId(), blob, summary: data.summary, createdAt: Date.now(), source: src, thumb: makeThumb(src) };
+      const nextHist = [entry, ...historyRef.current].slice(0, HISTORY_MAX);
+      setHistory(nextHist);
+      saveHistory(nextHist);
+      setAiDone(true);
       showToast('AI画像を追加しました');
     } catch (e) {
       setAiError(e.message);
@@ -339,19 +497,60 @@ export default function Home() {
     }
   };
 
+  const useHistory = (h) => {
+    addSlides([makeSlide(h.source, { prompt: h.summary, dim: autoDimFor(h.source) })]);
+    showToast('履歴の画像を追加しました');
+  };
+
+  const toggleHistSelect = (id) => {
+    setHistSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const deleteHistSelected = () => {
+    if (!histSelected.length) return;
+    if (!window.confirm(`選択した${histSelected.length}枚を履歴から削除しますか？`)) return;
+    const next = historyRef.current.filter((h) => !histSelected.includes(h.id));
+    setHistory(next);
+    saveHistory(next);
+    setHistSelected([]);
+    setHistSelecting(false);
+    showToast('履歴から削除しました');
+  };
+
   /* ───── 書き出し ───── */
   const opts = { format, tag, showUrl };
+
+  // PCはそのままダウンロード、スマホは「写真に保存・共有」パネルを出す
+  const deliver = (blob, name) => {
+    const file = new File([blob], name, { type: blob.type });
+    if (isTouchDevice() && navigator.canShare && navigator.canShare({ files: [file] })) {
+      setResult({ blob, name, file, isVideo: blob.type.startsWith('video') });
+    } else {
+      download(blob, name);
+      showToast(blob.type.startsWith('video') ? 'MP4動画を保存しました' : 'PNGを保存しました');
+    }
+  };
+
+  const shareResult = async () => {
+    if (!result) return;
+    try {
+      await navigator.share({ files: [result.file] });
+      setResult(null);
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      download(result.blob, result.name);
+      setResult(null);
+    }
+  };
 
   const savePng = async (index) => {
     const s = slidesRef.current[index];
     if (!s) return;
-    await ensureFonts([tag, s.catch]);
+    setExportError('');
+    await ensureFonts([tag, s.catch, s.sub]);
     const c = renderToCanvas(s, opts);
     c.toBlob((b) => {
-      if (b) {
-        download(b, `ksvox_${format === 'vertical' ? '9x16' : '1x1'}_${stamp()}.png`);
-        showToast('PNGを保存しました');
-      }
+      if (b) deliver(b, `ksvox_${format === 'vertical' ? '9x16' : '1x1'}_${stamp()}.png`);
     }, 'image/png');
   };
 
@@ -361,42 +560,16 @@ export default function Home() {
     setProgress(0);
     try {
       const list = slidesRef.current;
-      await ensureFonts([tag, ...list.map((s) => s.catch)]);
+      await ensureFonts([tag, ...list.map((s) => `${s.catch}${s.sub}`)]);
       const frames = list.map((s) => renderToCanvas(s, opts));
       const { exportMp4 } = await import('../lib/video');
       const blob = await exportMp4(frames, duration, (p) => setProgress(p));
-      download(blob, `ksvox_${format === 'vertical' ? '9x16' : '1x1'}_${stamp()}.mp4`);
-      showToast('MP4動画を保存しました');
+      deliver(blob, `ksvox_${format === 'vertical' ? '9x16' : '1x1'}_${stamp()}.mp4`);
     } catch (e) {
       setExportError(e.message || '動画を書き出せませんでした。');
     } finally {
       setExporting(false);
       setProgress(null);
-    }
-  };
-
-  /* ───── 説明文 ───── */
-  const makeCaption = async () => {
-    const hasText = tag.trim() || slides.some((s) => s.catch.trim());
-    if (!hasText) {
-      setCapError('シリーズタグかキャッチを入力してから作成してください。');
-      return;
-    }
-    setCapBusy(true);
-    setCapError('');
-    try {
-      const data = await postJSON('/api/caption', {
-        password: pwRef.current,
-        docs,
-        seriesTag: tag,
-        slides: slides.map((s) => ({ catch: s.catch, prompt: s.prompt })),
-      });
-      setCaption(data.caption || '');
-      setHashtags(data.hashtags || ['', '', '']);
-    } catch (e) {
-      setCapError(e.message);
-    } finally {
-      setCapBusy(false);
     }
   };
 
@@ -414,17 +587,18 @@ export default function Home() {
     setDocs(docsDraft);
     localStorage.setItem(LS.docs, docsDraft);
     setSettingsOpen(false);
-    showToast('K\'s VOX資料を保存しました');
+    showToast("K's VOX資料を保存しました");
   };
   const logout = () => {
     localStorage.removeItem(LS.pw);
     pwRef.current = '';
     setSettingsOpen(false);
+    setReady(false);
     setAuth('locked');
   };
 
   /* ───── 画面 ───── */
-  if (auth === 'checking') return <div className="login" />;
+  if (auth === 'checking' || (auth === 'ok' && !ready)) return <div className="login" />;
   if (auth === 'locked') {
     return (
       <Login
@@ -441,7 +615,6 @@ export default function Home() {
 
   const current = slides[active];
   const multi = slides.length > 1;
-  const tagsText = hashtags.filter(Boolean).join(' ');
 
   return (
     <div className="app">
@@ -450,9 +623,14 @@ export default function Home() {
           <span className="brand-name">K&apos;s VOX</span>
           <span className="brand-sub">投稿スタジオ</span>
         </div>
-        <button className="btn btn-ghost" onClick={openSettings}>
-          K&apos;s VOX資料・設定
-        </button>
+        <div className="header-actions">
+          <button className="btn btn-ghost" onClick={startOver}>
+            新しく始める
+          </button>
+          <button className="btn btn-ghost" onClick={openSettings} aria-label="設定">
+            設定
+          </button>
+        </div>
       </header>
 
       <main className="layout">
@@ -463,14 +641,9 @@ export default function Home() {
             <div className="seg">
               {[
                 ['square', '正方形 1:1', 'GBP・Instagram・X'],
-                ['vertical', '縦長 9:16', 'TikTok・リール・ストーリーズ'],
+                ['vertical', '縦長 9:16', 'TikTok・リール'],
               ].map(([v, name, sub]) => (
-                <button
-                  key={v}
-                  className={`seg-item ${format === v ? 'is-on' : ''}`}
-                  onClick={() => setFormat(v)}
-                  aria-pressed={format === v}
-                >
+                <button key={v} className={`seg-item ${format === v ? 'is-on' : ''}`} onClick={() => setFormat(v)} aria-pressed={format === v}>
                   <span className="seg-name">{name}</span>
                   <span className="seg-sub">{sub}</span>
                 </button>
@@ -480,16 +653,27 @@ export default function Home() {
 
           <section className="block">
             <h2 className="block-title">シリーズタグ</h2>
-            <input
-              className="input input-mincho"
-              value={tag}
-              onChange={(e) => setTag(e.target.value)}
-              placeholder="例：英語で歌えば上手くなる"
-            />
+            <input className="input input-mincho" value={tag} onChange={(e) => setTag(e.target.value)} placeholder="例：英語で歌えば上手くなる" />
             <label className="check">
               <input type="checkbox" checked={showUrl} onChange={(e) => setShowUrl(e.target.checked)} />
               <span>下部に www.ksvox.net を入れる</span>
             </label>
+          </section>
+
+          <section className="block">
+            <div className="block-head">
+              <h2 className="block-title">SNS投稿文</h2>
+              <button className="link" onClick={() => copy(postText, '投稿文')} disabled={!postText.trim()}>
+                コピー
+              </button>
+            </div>
+            <textarea
+              className="input"
+              rows={4}
+              value={postText}
+              onChange={(e) => setPostText(e.target.value)}
+              placeholder="SNSに載せる文章を書いておくと、AI画像生成のときに内容を反映します（空欄でもOK）"
+            />
           </section>
 
           <section className="block">
@@ -530,15 +714,12 @@ export default function Home() {
                 </div>
                 <label className="ai-field">
                   <span className="sub-label">追加の指示（日本語で自由に）</span>
-                  <textarea
-                    className="input"
-                    rows={2}
-                    value={aiExtra}
-                    onChange={(e) => setAiExtra(e.target.value)}
-                    placeholder="例：場所は誰もいない静かな海辺"
-                  />
+                  <textarea className="input" rows={2} value={aiExtra} onChange={(e) => setAiExtra(e.target.value)} placeholder="例：場所は誰もいない静かな海辺" />
                 </label>
-                <p className="hint">選ばなかった項目はおまかせです。項目と追加の指示が食い違うときは、追加の指示が優先されます。K&apos;s VOXらしい質感（シネマティック・暖色系・文字なし）は自動で加わります。</p>
+                <p className="hint">
+                  {postText.trim() ? '✓ SNS投稿文の内容も反映します。' : 'SNS投稿文が空欄なので、項目と追加の指示だけで作ります。'}
+                  優先順位は「追加の指示 → 項目 → 投稿文」です。
+                </p>
                 {aiError && <p className="error">{aiError}</p>}
                 <div className="ai-actions">
                   <button
@@ -546,12 +727,13 @@ export default function Home() {
                     onClick={() => {
                       setAiChoices({});
                       setAiExtra('');
+                      setAiDone(false);
                     }}
                   >
                     選択をリセット
                   </button>
                   <button className="btn btn-primary" onClick={generateAi} disabled={aiBusy || !aiReady}>
-                    {aiBusy ? '生成しています…（10〜30秒）' : '画像を生成する'}
+                    {aiBusy ? '生成しています…（10〜30秒）' : aiDone ? '同じ内容でもう1枚生成' : '画像を生成する'}
                   </button>
                 </div>
               </div>
@@ -581,18 +763,81 @@ export default function Home() {
                 </div>
               ))}
             </div>
+
+            <div className="hist">
+              <button className="hist-toggle" onClick={() => setHistOpen((v) => !v)} aria-expanded={histOpen}>
+                <span>AI画像の履歴</span>
+                <span className="count">
+                  {history.length} / {HISTORY_MAX} {histOpen ? '▲' : '▼'}
+                </span>
+              </button>
+              {histOpen && (
+                <div className="hist-body">
+                  {history.length === 0 ? (
+                    <p className="hint">AIで生成した画像が、ここに最新{HISTORY_MAX}枚まで残ります。</p>
+                  ) : (
+                    <>
+                      <p className="hint">{histSelecting ? '削除する画像をタップして選んでください。' : 'タップすると作業中の画像に追加します。'}</p>
+                      <div className="hist-grid">
+                        {history.map((h) => {
+                          const sel = histSelected.includes(h.id);
+                          return (
+                            <button
+                              key={h.id}
+                              className={`hist-item ${sel ? 'is-sel' : ''}`}
+                              onClick={() => (histSelecting ? toggleHistSelect(h.id) : useHistory(h))}
+                              title={h.summary}
+                            >
+                              <img src={h.thumb} alt="" />
+                              {histSelecting && <span className="hist-check">{sel ? '✓' : ''}</span>}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="ai-actions">
+                        {histSelecting ? (
+                          <>
+                            <button
+                              className="link"
+                              onClick={() => {
+                                setHistSelecting(false);
+                                setHistSelected([]);
+                              }}
+                            >
+                              やめる
+                            </button>
+                            <button className="btn btn-danger" onClick={deleteHistSelected} disabled={!histSelected.length}>
+                              選択した{histSelected.length}枚を削除
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <span />
+                            <button className="btn" onClick={() => setHistSelecting(true)}>
+                              選択して削除
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
           </section>
 
           {current && (
             <section className="block">
               <div className="block-head">
-                <h2 className="block-title">キャッチと写真（{active + 1}枚目）</h2>
+                <h2 className="block-title">文字と写真（{active + 1}枚目）</h2>
                 {current.bgType && (
                   <button className="link" onClick={redrawBackground}>
                     背景を描き直す
                   </button>
                 )}
               </div>
+
+              <div className="sub-head">キャッチ</div>
               <textarea
                 className="input input-catch"
                 rows={2}
@@ -600,54 +845,42 @@ export default function Home() {
                 onChange={(e) => updateActive({ catch: e.target.value.split('\n').slice(0, 2).join('\n') })}
                 placeholder={'人生経験を積んだ今だから、\n歌える歌がある'}
               />
-              <p className="hint">改行した位置で2行に分かれます（最大2行）。</p>
+              <StyleControls
+                color={current.color}
+                size={current.size}
+                min={40}
+                max={130}
+                defaultSize={DEFAULT_CATCH_SIZE}
+                onColor={(v) => updateActive({ color: v })}
+                onSize={(v) => updateActive({ size: v })}
+              />
+
+              <div className="sub-head">サブテキスト（キャッチの下）</div>
+              <textarea
+                className="input"
+                rows={2}
+                value={current.sub}
+                onChange={(e) => updateActive({ sub: e.target.value.split('\n').slice(0, 2).join('\n') })}
+                placeholder="空欄ならキャッチだけが中央に入ります"
+              />
+              <StyleControls
+                color={current.subColor}
+                size={current.subSize}
+                min={24}
+                max={80}
+                defaultSize={DEFAULT_SUB_SIZE}
+                onColor={(v) => updateActive({ subColor: v })}
+                onSize={(v) => updateActive({ subSize: v })}
+              />
+              <p className="hint">どちらも改行した位置で2行に分かれます（各最大2行）。キャッチとサブテキストは、まとめて上下中央に配置されます。</p>
               {shrunk && <p className="warn">文字が長いため、画像からはみ出さないよう自動で小さくしています。</p>}
 
-              <div className="sub-label">文字色</div>
-              <div className="swatches">
-                {COLORS.map((c) => (
-                  <button
-                    key={c.v}
-                    className={`swatch ${current.color.toUpperCase() === c.v ? 'is-on' : ''}`}
-                    style={{ background: c.v }}
-                    onClick={() => updateActive({ color: c.v })}
-                    aria-label={c.n}
-                    title={c.n}
-                  />
-                ))}
-                <label className="swatch-free" title="自由に選ぶ">
-                  <input type="color" value={current.color} onChange={(e) => updateActive({ color: e.target.value.toUpperCase() })} />
-                  <span>自由に選ぶ</span>
-                </label>
-              </div>
-
-              <div className="sub-label">
-                文字サイズ <span className="value">{current.size}</span>
-              </div>
+              <div className="sub-head">写真の暗さ</div>
               <div className="range-row">
-                <input
-                  type="range"
-                  min={40}
-                  max={130}
-                  value={current.size}
-                  onChange={(e) => updateActive({ size: Number(e.target.value) })}
-                />
-                <button className="link" onClick={() => updateActive({ size: DEFAULT_CATCH_SIZE })}>
-                  標準に戻す
-                </button>
-              </div>
-
-              <div className="sub-label">
-                写真の暗さ <span className="value">{current.dim}%</span>
-              </div>
-              <div className="range-row">
-                <input
-                  type="range"
-                  min={0}
-                  max={70}
-                  value={current.dim}
-                  onChange={(e) => updateActive({ dim: Number(e.target.value) })}
-                />
+                <span className="sub-label">
+                  暗さ <span className="value">{current.dim}%</span>
+                </span>
+                <input type="range" min={0} max={70} value={current.dim} onChange={(e) => updateActive({ dim: Number(e.target.value) })} />
                 <button className="link" onClick={() => updateActive({ dim: autoDimFor(current.source) })}>
                   おまかせ
                 </button>
@@ -657,12 +890,7 @@ export default function Home() {
                   ['center', '文字の周りだけ'],
                   ['all', '写真全体'],
                 ].map(([v, name]) => (
-                  <button
-                    key={v}
-                    className={`seg-item ${current.dimMode === v ? 'is-on' : ''}`}
-                    onClick={() => updateActive({ dimMode: v })}
-                    aria-pressed={current.dimMode === v}
-                  >
+                  <button key={v} className={`seg-item ${current.dimMode === v ? 'is-on' : ''}`} onClick={() => updateActive({ dimMode: v })} aria-pressed={current.dimMode === v}>
                     <span className="seg-name">{name}</span>
                   </button>
                 ))}
@@ -699,7 +927,9 @@ export default function Home() {
             ) : (
               <>
                 <div className="export-row">
-                  <label className="sub-label" htmlFor="dur">1枚の表示時間</label>
+                  <label className="sub-label" htmlFor="dur">
+                    1枚の表示時間
+                  </label>
                   <select id="dur" className="select" value={duration} onChange={(e) => setDuration(Number(e.target.value))}>
                     {DURATIONS.map((d) => (
                       <option key={d} value={d}>
@@ -723,54 +953,43 @@ export default function Home() {
               </>
             )}
             {exportError && <p className="error">{exportError}</p>}
-          </section>
-
-          <section className="block caption">
-            <div className="block-head">
-              <h2 className="block-title">説明文とハッシュタグ</h2>
-              <button className="btn" onClick={makeCaption} disabled={capBusy}>
-                {capBusy ? '作成しています…' : caption ? '作り直す' : '作成する'}
-              </button>
-            </div>
-            <p className="hint">シリーズタグ・キャッチ・AI画像の内容とK&apos;s VOX資料をもとに作ります。画像には入りません。</p>
-            {capError && <p className="error">{capError}</p>}
-
-            <div className="copy-head">
-              <span className="sub-label">説明文</span>
-              <button className="link" onClick={() => copy(caption, '説明文')} disabled={!caption.trim()}>
-                コピー
-              </button>
-            </div>
-            <textarea className="input" rows={7} value={caption} onChange={(e) => setCaption(e.target.value)} />
-
-            <div className="copy-head">
-              <span className="sub-label">ハッシュタグ</span>
-              <button className="link" onClick={() => copy(tagsText, 'ハッシュタグ')} disabled={!tagsText}>
-                コピー
-              </button>
-            </div>
-            <div className="tags">
-              {hashtags.map((h, i) => (
-                <input
-                  key={i}
-                  className="input"
-                  value={h}
-                  onChange={(e) => setHashtags((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))}
-                />
-              ))}
-            </div>
-            <button className="link" onClick={() => copy(`${caption}\n\n${tagsText}`, '説明文とハッシュタグ')} disabled={!caption.trim()}>
-              説明文とハッシュタグをまとめてコピー
-            </button>
+            <p className="hint">作業内容はこの端末に自動で保存されます。タブを閉じても、次に開くと続きから再開できます。</p>
           </section>
         </div>
       </main>
+
+      {result && (
+        <div className="modal" role="dialog" aria-modal="true" onClick={() => setResult(null)}>
+          <div className="modal-card sheet" onClick={(e) => e.stopPropagation()}>
+            <h2 className="modal-title">{result.isVideo ? '動画' : '画像'}の準備ができました</h2>
+            <p className="hint">「写真に保存・共有」から「画像を保存」「ビデオを保存」を選ぶと、写真アプリに保存できます。</p>
+            <button className="btn btn-primary btn-block btn-lg" onClick={shareResult}>
+              写真に保存・共有
+            </button>
+            <div className="modal-actions">
+              <button
+                className="link"
+                onClick={() => {
+                  download(result.blob, result.name);
+                  setResult(null);
+                }}
+              >
+                ファイルとしてダウンロード
+              </button>
+              <span className="spacer" />
+              <button className="btn" onClick={() => setResult(null)}>
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {settingsOpen && (
         <div className="modal" role="dialog" aria-modal="true" onClick={() => setSettingsOpen(false)}>
           <div className="modal-card" onClick={(e) => e.stopPropagation()}>
             <h2 className="modal-title">K&apos;s VOX資料</h2>
-            <p className="hint">説明文とハッシュタグを作るときの参考資料です。書き換えると次の作成から反映されます（このブラウザに保存されます）。</p>
+            <p className="hint">AI画像生成で、SNS投稿文や追加の指示を読み取るときに、K&apos;s VOXの雰囲気に合う場面を選ぶための参考資料です（画像に文字は入りません）。このブラウザに保存されます。</p>
             <textarea className="input docs" value={docsDraft} onChange={(e) => setDocsDraft(e.target.value)} />
             <div className="modal-actions">
               <button className="link" onClick={() => setDocsDraft(DEFAULT_DOCS)}>
