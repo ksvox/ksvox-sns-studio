@@ -69,8 +69,8 @@ export default async function handler(req, res) {
       {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        // seedを毎回変えるので、同じ内容でも別の画像になる
-        body: JSON.stringify({ prompt: finalPrompt, steps: 8, seed: Math.floor(Math.random() * 2147483646) + 1 }),
+        // seedは指定しない（指定しなければ毎回ランダムに描かれるので、同じ内容でも別の画像になる）
+        body: JSON.stringify({ prompt: finalPrompt, steps: 8 }),
       }
     );
     const data = await cf.json().catch(() => ({}));
